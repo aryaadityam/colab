@@ -89,7 +89,32 @@ The server exposes:
 
 - `GET /health`
 - `POST /remove-background`
-- `POST /object-label`
+- `POST /remove-video-background`
+- `POST /object-label` returns an empty disabled label response for old app
+  compatibility.
 
 Oversized input images are resized to `MAX_PROCESS_SIDE=2048` on the longest
 side before background removal.
+
+Video defaults are intentionally small for Colab demos:
+
+- `MAX_VIDEO_UPLOAD_BYTES=83886080`
+- `MAX_VIDEO_SECONDS=6`
+- `MAX_VIDEO_FPS=12`
+- `MAX_VIDEO_SIDE=960`
+
+Default video output is transparent WebM:
+
+```bash
+curl -X POST --data-binary @input.mp4 \
+  "https://your-server/remove-video-background?format=webm" \
+  -o output.webm
+```
+
+For MP4 compatibility, use a flattened background:
+
+```bash
+curl -X POST --data-binary @input.mp4 \
+  "https://your-server/remove-video-background?format=mp4&background=white" \
+  -o output.mp4
+```

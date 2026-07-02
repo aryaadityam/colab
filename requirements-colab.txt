@@ -6,5 +6,5 @@ nvidia-cudnn-cu12==9.1.0.70
 onnxruntime-gpu==1.20.1
 rembg[gpu]==2.0.67
 torch>=2.2
-transformers>=4.44
+imageio-ffmpeg>=0.5
 pyngrok>=7.2

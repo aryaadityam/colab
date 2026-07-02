@@ -3,16 +3,15 @@ import ctypes
 import glob
 import io
 import os
-import re
 import shutil
 import stat
 import subprocess
 import sys
 import threading
-import time
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -63,7 +62,7 @@ except Exception:
 _preload_cuda_libraries()
 
 import onnxruntime as ort
-from PIL import Image, ImageOps
+from PIL import Image, ImageColor, ImageOps
 from rembg import new_session, remove
 from starlette.concurrency import run_in_threadpool
 
@@ -79,8 +78,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--object-label-model",
-        default="Salesforce/blip-image-captioning-base",
-        help='Set to "off" to disable object labels.',
+        default="off",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--tunnel",
@@ -96,17 +95,22 @@ def _parse_args() -> argparse.Namespace:
 ARGS = _parse_args()
 os.environ.setdefault("U2NET_HOME", "/content/.u2net")
 os.environ["CAPWORDS_SERVER_MODEL"] = ARGS.model
-os.environ["CAPWORDS_OBJECT_LABEL_MODEL"] = ARGS.object_label_model
 os.environ.setdefault("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024))
 os.environ.setdefault("MAX_PROCESS_SIDE", "2048")
+os.environ.setdefault("MAX_VIDEO_UPLOAD_BYTES", str(80 * 1024 * 1024))
+os.environ.setdefault("MAX_VIDEO_SECONDS", "6")
+os.environ.setdefault("MAX_VIDEO_FPS", "12")
+os.environ.setdefault("MAX_VIDEO_SIDE", "960")
 
 MODEL_NAME = os.getenv("CAPWORDS_SERVER_MODEL", "birefnet-general").strip()
-OBJECT_LABEL_MODEL = os.getenv(
-    "CAPWORDS_OBJECT_LABEL_MODEL",
-    "Salesforce/blip-image-captioning-base",
-).strip()
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
 MAX_PROCESS_SIDE = int(os.getenv("MAX_PROCESS_SIDE", "2048"))
+MAX_VIDEO_UPLOAD_BYTES = int(
+    os.getenv("MAX_VIDEO_UPLOAD_BYTES", str(80 * 1024 * 1024))
+)
+MAX_VIDEO_SECONDS = float(os.getenv("MAX_VIDEO_SECONDS", "6"))
+MAX_VIDEO_FPS = int(os.getenv("MAX_VIDEO_FPS", "12"))
+MAX_VIDEO_SIDE = int(os.getenv("MAX_VIDEO_SIDE", "960"))
 
 app = FastAPI(title="CapWords Colab GPU Server")
 
@@ -127,11 +131,15 @@ def health() -> dict[str, object]:
         "ok": True,
         "provider": "capwords-colab",
         "model": MODEL_NAME,
-        "objectLabelModel": OBJECT_LABEL_MODEL if _object_label_enabled() else None,
+        "objectLabelModel": None,
         "onnxruntimeDevice": ort.get_device(),
         "onnxruntimeProviders": ort.get_available_providers(),
         "maxUploadBytes": MAX_UPLOAD_BYTES,
         "maxProcessSide": MAX_PROCESS_SIDE,
+        "maxVideoUploadBytes": MAX_VIDEO_UPLOAD_BYTES,
+        "maxVideoSeconds": MAX_VIDEO_SECONDS,
+        "maxVideoFps": MAX_VIDEO_FPS,
+        "maxVideoSide": MAX_VIDEO_SIDE,
     }
 
 
@@ -156,52 +164,86 @@ async def remove_background(request: Request) -> Response:
     )
 
 
-@app.post("/object-label")
-async def object_label(request: Request) -> JSONResponse:
-    image_bytes = await _read_limited_body(request)
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="Body gambar kosong.")
+@app.post("/remove-video-background")
+async def remove_video_background(request: Request) -> Response:
+    video_bytes = await _read_limited_body(
+        request,
+        max_bytes=MAX_VIDEO_UPLOAD_BYTES,
+    )
+    if not video_bytes:
+        raise HTTPException(status_code=400, detail="Body video kosong.")
+
+    output_format = request.query_params.get("format", "webm")
+    background = request.query_params.get("background", "white")
 
     try:
-        result = await run_in_threadpool(_object_label_sync, image_bytes)
+        media_type, output_bytes = await run_in_threadpool(
+            _remove_video_background_sync,
+            video_bytes,
+            output_format,
+            background,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Server object label gagal: {error}",
+            detail=f"Server remove video background gagal: {error}",
         ) from error
 
-    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+    return Response(
+        content=output_bytes,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
-async def _read_limited_body(request: Request) -> bytes:
+@app.post("/object-label")
+async def object_label(request: Request) -> JSONResponse:
+    await _read_limited_body(request)
+    return JSONResponse(
+        content={"label": None, "caption": None, "model": None},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _read_limited_body(
+    request: Request,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+) -> bytes:
     chunks: list[bytes] = []
     total = 0
 
     async for chunk in request.stream():
         total += len(chunk)
-        if total > MAX_UPLOAD_BYTES:
+        if total > max_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"Upload terlalu besar. Max {MAX_UPLOAD_BYTES} bytes.",
+                detail=f"Upload terlalu besar. Max {max_bytes} bytes.",
             )
         chunks.append(chunk)
 
     return b"".join(chunks)
 
 
-def _remove_background_sync(image_bytes: bytes) -> bytes:
-    result = remove(_prepare_remove_image(image_bytes), session=_model_session())
+def _remove_background_sync(image_bytes: bytes, max_side: int | None = None) -> bytes:
+    result = remove(
+        _prepare_remove_image(image_bytes, max_side=max_side),
+        session=_model_session(),
+    )
     if isinstance(result, bytes):
         return result
     raise RuntimeError("Model tidak mengembalikan PNG bytes.")
 
 
-def _prepare_remove_image(image_bytes: bytes) -> bytes:
+def _prepare_remove_image(image_bytes: bytes, max_side: int | None = None) -> bytes:
     image = Image.open(io.BytesIO(image_bytes))
     image = ImageOps.exif_transpose(image)
     longest_side = max(image.size)
-    if MAX_PROCESS_SIDE > 0 and longest_side > MAX_PROCESS_SIDE:
-        scale = MAX_PROCESS_SIDE / longest_side
+    process_side = MAX_PROCESS_SIDE if max_side is None else max_side
+    if process_side > 0 and longest_side > process_side:
+        scale = process_side / longest_side
         size = (
             max(1, round(image.width * scale)),
             max(1, round(image.height * scale)),
@@ -216,135 +258,212 @@ def _prepare_remove_image(image_bytes: bytes) -> bytes:
     return output.getvalue()
 
 
-def _object_label_sync(image_bytes: bytes) -> dict[str, object]:
-    if not _object_label_enabled():
-        return {"label": None, "caption": None, "model": None}
+def _remove_video_background_sync(
+    video_bytes: bytes,
+    output_format: str,
+    background: str,
+) -> tuple[str, bytes]:
+    normalized_format = _normalize_video_format(output_format)
+    ffmpeg = _ffmpeg_bin()
 
-    image = _open_label_image(image_bytes)
-    caption = _caption_image(image)
-    return {
-        "label": _caption_to_label(caption),
-        "caption": caption,
-        "model": OBJECT_LABEL_MODEL,
+    with TemporaryDirectory(prefix="capwords-video-") as tmp:
+        tmp_path = Path(tmp)
+        input_path = tmp_path / "input-video"
+        source_frames = tmp_path / "source-frames"
+        output_frames = tmp_path / "output-frames"
+        source_frames.mkdir()
+        output_frames.mkdir()
+        input_path.write_bytes(video_bytes)
+
+        _run_command(_extract_frames_command(ffmpeg, input_path, source_frames))
+        frames = sorted(source_frames.glob("frame_*.png"))
+        if not frames:
+            raise RuntimeError("Tidak ada frame video yang bisa diproses.")
+
+        for frame in frames:
+            png_bytes = _remove_background_sync(frame.read_bytes(), MAX_VIDEO_SIDE)
+            image = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+            if normalized_format == "mp4":
+                image = _flatten_rgba(image, background)
+            image.save(output_frames / frame.name, format="PNG")
+            image.close()
+
+        if normalized_format == "mp4":
+            output_path = tmp_path / "output.mp4"
+            _run_command(_encode_mp4_command(ffmpeg, output_frames, output_path))
+            return "video/mp4", output_path.read_bytes()
+
+        output_path = tmp_path / "output.webm"
+        _run_command(_encode_webm_command(ffmpeg, output_frames, output_path))
+        return "video/webm", output_path.read_bytes()
+
+
+def _normalize_video_format(output_format: str) -> str:
+    value = output_format.strip().lower()
+    if value in {"", "webm", "transparent", "alpha"}:
+        return "webm"
+    if value in {"mp4", "mpeg4"}:
+        return "mp4"
+    raise ValueError("Format video harus webm atau mp4.")
+
+
+def _extract_frames_command(
+    ffmpeg: str,
+    input_path: Path,
+    frames_dir: Path,
+) -> list[str]:
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+    ]
+    if MAX_VIDEO_SECONDS > 0:
+        command.extend(["-t", _format_number(MAX_VIDEO_SECONDS)])
+    command.extend(["-i", str(input_path), "-an"])
+    filter_graph = _video_filter_graph()
+    if filter_graph:
+        command.extend(["-vf", filter_graph])
+    command.append(str(frames_dir / "frame_%06d.png"))
+    return command
+
+
+def _video_filter_graph() -> str:
+    filters: list[str] = []
+    fps = _video_fps()
+    if fps > 0:
+        filters.append(f"fps={fps}")
+    if MAX_VIDEO_SIDE > 0:
+        filters.append(
+            "scale="
+            f"'if(gte(a,1),min(iw,{MAX_VIDEO_SIDE}),-2)':"
+            f"'if(gte(a,1),-2,min(ih,{MAX_VIDEO_SIDE}))':"
+            "flags=lanczos"
+        )
+    filters.append("setsar=1")
+    return ",".join(filters)
+
+
+def _encode_webm_command(
+    ffmpeg: str,
+    frames_dir: Path,
+    output_path: Path,
+) -> list[str]:
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-framerate",
+        str(_video_fps()),
+        "-i",
+        str(frames_dir / "frame_%06d.png"),
+        "-c:v",
+        "libvpx-vp9",
+        "-pix_fmt",
+        "yuva420p",
+        "-auto-alt-ref",
+        "0",
+        "-row-mt",
+        "1",
+        "-b:v",
+        "0",
+        "-crf",
+        "32",
+        str(output_path),
+    ]
+
+
+def _encode_mp4_command(
+    ffmpeg: str,
+    frames_dir: Path,
+    output_path: Path,
+) -> list[str]:
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-framerate",
+        str(_video_fps()),
+        "-i",
+        str(frames_dir / "frame_%06d.png"),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-preset",
+        "medium",
+        "-crf",
+        "20",
+        str(output_path),
+    ]
+
+
+def _run_command(command: list[str]) -> None:
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode == 0:
+        return
+    message = (result.stderr or result.stdout or "ffmpeg gagal.").strip()
+    raise RuntimeError(message[-1400:])
+
+
+def _flatten_rgba(image: Image.Image, background: str) -> Image.Image:
+    rgb = _background_rgb(background)
+    canvas = Image.new("RGBA", image.size, (*rgb, 255))
+    canvas.alpha_composite(image)
+    return canvas.convert("RGB")
+
+
+def _background_rgb(background: str) -> tuple[int, int, int]:
+    presets = {
+        "white": (255, 255, 255),
+        "black": (0, 0, 0),
+        "gray": (230, 230, 222),
+        "grey": (230, 230, 222),
+        "green": (0, 255, 0),
     }
+    value = background.strip().lower()
+    if value in presets:
+        return presets[value]
+    try:
+        color = ImageColor.getrgb(value)
+    except ValueError:
+        return presets["white"]
+    return color[:3]
 
 
-def _open_label_image(image_bytes: bytes) -> Image.Image:
-    image = Image.open(io.BytesIO(image_bytes))
-    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
-        rgba = image.convert("RGBA")
-        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-        background.alpha_composite(rgba)
-        return background.convert("RGB")
-    return image.convert("RGB")
+def _format_number(value: float) -> str:
+    return str(int(value)) if value.is_integer() else str(value)
 
 
-def _caption_image(image: Image.Image) -> str:
-    processor, model, torch, device = _object_label_session()
-    inputs = processor(image, return_tensors="pt")
-    inputs = {key: value.to(device) for key, value in inputs.items()}
-    with torch.inference_mode():
-        output = model.generate(**inputs, max_new_tokens=18)
-    return processor.decode(output[0], skip_special_tokens=True).strip()
+def _video_fps() -> int:
+    return max(1, MAX_VIDEO_FPS)
 
 
-def _caption_to_label(caption: str) -> str | None:
-    text = re.sub(r"\s+", " ", caption.lower()).strip(" .,:;")
-    if not text:
-        return None
+@lru_cache(maxsize=1)
+def _ffmpeg_bin() -> str:
+    existing = shutil.which("ffmpeg")
+    if existing:
+        return existing
+    try:
+        import imageio_ffmpeg
 
-    substitutions = [
-        r"^(there is|there are)\s+",
-        r"^(a|an|the)\s+(photo|picture|image|photograph)\s+of\s+",
-        r"^(a|an|the)\s+close[- ]up\s+of\s+",
-        r"^close[- ]up\s+of\s+",
-        r"^(a|an|the)\s+pair\s+of\s+",
-        r"^(a|an|the)\s+",
-    ]
-    for pattern in substitutions:
-        text = re.sub(pattern, "", text).strip()
-
-    for splitter in (
-        " in front of ",
-        " next to ",
-        " sitting on ",
-        " standing on ",
-        " lying on ",
-        " laying on ",
-        " placed on ",
-        " with ",
-        " on ",
-        " in ",
-        " at ",
-    ):
-        if splitter in text:
-            text = text.split(splitter, 1)[0].strip()
-
-    text = re.sub(r"[^a-z0-9\s-]", "", text).strip()
-    words = [word for word in text.split() if word]
-    while words and words[0] in {
-        "small",
-        "large",
-        "big",
-        "little",
-        "black",
-        "white",
-        "red",
-        "blue",
-        "green",
-        "yellow",
-        "brown",
-        "gray",
-        "grey",
-        "plastic",
-        "wooden",
-        "metal",
-    }:
-        words.pop(0)
-    words = [
-        word
-        for word in words
-        if word
-        not in {
-            "object",
-            "item",
-            "thing",
-            "stuff",
-            "piece",
-            "photo",
-            "image",
-            "picture",
-            "person",
-            "someone",
-            "hand",
-            "hands",
-        }
-    ]
-    if not words:
-        return None
-    return words[0]
-
-
-def _object_label_enabled() -> bool:
-    return OBJECT_LABEL_MODEL.lower() not in {"", "0", "false", "off", "none"}
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as error:
+        raise RuntimeError(
+            "ffmpeg belum tersedia. Install ffmpeg atau imageio-ffmpeg."
+        ) from error
 
 
 @lru_cache(maxsize=1)
 def _model_session():
     return new_session(MODEL_NAME)
-
-
-@lru_cache(maxsize=1)
-def _object_label_session():
-    import torch
-    from transformers import BlipForConditionalGeneration, BlipProcessor
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor = BlipProcessor.from_pretrained(OBJECT_LABEL_MODEL)
-    model = BlipForConditionalGeneration.from_pretrained(OBJECT_LABEL_MODEL)
-    model.to(device)
-    model.eval()
-    return processor, model, torch, device
 
 
 def _install_cloudflared() -> str:
@@ -437,7 +556,11 @@ def _start_tunnel() -> object | None:
 def main() -> None:
     print("CapWords Colab server")
     print(f"Model: {MODEL_NAME}")
-    print(f"Object label model: {OBJECT_LABEL_MODEL}")
+    print("Object label model: disabled")
+    print(
+        "Video: "
+        f"max {MAX_VIDEO_SECONDS}s, {MAX_VIDEO_FPS} fps, {MAX_VIDEO_SIDE}px side"
+    )
     print(f"ONNX Runtime device before warmup: {ort.get_device()}")
     print(f"ONNX Runtime providers: {ort.get_available_providers()}")
     _start_tunnel()
