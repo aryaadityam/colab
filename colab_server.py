@@ -101,6 +101,8 @@ os.environ.setdefault("MAX_VIDEO_UPLOAD_BYTES", str(80 * 1024 * 1024))
 os.environ.setdefault("MAX_VIDEO_SECONDS", "6")
 os.environ.setdefault("MAX_VIDEO_FPS", "12")
 os.environ.setdefault("MAX_VIDEO_SIDE", "960")
+os.environ.setdefault("RVM_MODEL", "mobilenetv3")
+os.environ.setdefault("RVM_DOWNSAMPLE_RATIO", "auto")
 
 MODEL_NAME = os.getenv("CAPWORDS_SERVER_MODEL", "birefnet-general").strip()
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
@@ -111,6 +113,8 @@ MAX_VIDEO_UPLOAD_BYTES = int(
 MAX_VIDEO_SECONDS = float(os.getenv("MAX_VIDEO_SECONDS", "6"))
 MAX_VIDEO_FPS = int(os.getenv("MAX_VIDEO_FPS", "12"))
 MAX_VIDEO_SIDE = int(os.getenv("MAX_VIDEO_SIDE", "960"))
+RVM_MODEL = os.getenv("RVM_MODEL", "mobilenetv3").strip() or "mobilenetv3"
+RVM_DOWNSAMPLE_RATIO = os.getenv("RVM_DOWNSAMPLE_RATIO", "auto").strip()
 
 app = FastAPI(title="CapWords Colab GPU Server")
 
@@ -140,6 +144,8 @@ def health() -> dict[str, object]:
         "maxVideoSeconds": MAX_VIDEO_SECONDS,
         "maxVideoFps": MAX_VIDEO_FPS,
         "maxVideoSide": MAX_VIDEO_SIDE,
+        "videoModel": f"rvm-{RVM_MODEL}",
+        "videoDownsampleRatio": RVM_DOWNSAMPLE_RATIO,
     }
 
 
@@ -280,13 +286,12 @@ def _remove_video_background_sync(
         if not frames:
             raise RuntimeError("Tidak ada frame video yang bisa diproses.")
 
-        for frame in frames:
-            png_bytes = _remove_background_sync(frame.read_bytes(), MAX_VIDEO_SIDE)
-            image = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-            if normalized_format == "mp4":
-                image = _flatten_rgba(image, background)
-            image.save(output_frames / frame.name, format="PNG")
-            image.close()
+        _write_rvm_video_frames(
+            frames,
+            output_frames,
+            output_format=normalized_format,
+            background=background,
+        )
 
         if normalized_format == "mp4":
             output_path = tmp_path / "output.mp4"
@@ -405,6 +410,67 @@ def _encode_mp4_command(
     ]
 
 
+def _write_rvm_video_frames(
+    frames: list[Path],
+    output_frames: Path,
+    *,
+    output_format: str,
+    background: str,
+) -> None:
+    model, torch, device = _rvm_session()
+    downsample_ratio = _rvm_downsample_ratio()
+    rec = [None, None, None, None]
+
+    with torch.inference_mode():
+        for frame in frames:
+            image = Image.open(frame).convert("RGB")
+            source = _pil_rgb_to_torch(image, torch, device)
+            image.close()
+
+            foreground, alpha, *rec = model(source, *rec, downsample_ratio)
+            rgba = _rvm_output_to_rgba(foreground, alpha, torch)
+            if output_format == "mp4":
+                rgba = _flatten_rgba(rgba, background)
+            rgba.save(output_frames / frame.name, format="PNG")
+            rgba.close()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _pil_rgb_to_torch(image: Image.Image, torch: object, device: str) -> object:
+    import numpy as np
+
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
+    return tensor.to(device, non_blocking=True)
+
+
+def _rvm_output_to_rgba(foreground: object, alpha: object, torch: object) -> Image.Image:
+    import numpy as np
+
+    foreground = foreground[0].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+    alpha = alpha[0, 0].detach().clamp(0, 1).cpu().numpy()
+    rgba = np.empty((foreground.shape[0], foreground.shape[1], 4), dtype=np.uint8)
+    rgba[:, :, :3] = (foreground * 255.0).round().astype(np.uint8)
+    rgba[:, :, 3] = (alpha * 255.0).round().astype(np.uint8)
+    del foreground, alpha
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def _rvm_downsample_ratio() -> float | None:
+    value = RVM_DOWNSAMPLE_RATIO.lower()
+    if value in {"", "auto", "none", "default"}:
+        return None
+    try:
+        ratio = float(value)
+    except ValueError as error:
+        raise RuntimeError("RVM_DOWNSAMPLE_RATIO harus auto atau angka float.") from error
+    if ratio <= 0:
+        return None
+    return ratio
+
+
 def _run_command(command: list[str]) -> None:
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode == 0:
@@ -464,6 +530,24 @@ def _ffmpeg_bin() -> str:
 @lru_cache(maxsize=1)
 def _model_session():
     return new_session(MODEL_NAME)
+
+
+@lru_cache(maxsize=1)
+def _rvm_session() -> tuple[object, object, str]:
+    import torch
+
+    if RVM_MODEL not in {"mobilenetv3", "resnet50"}:
+        raise RuntimeError("RVM_MODEL harus mobilenetv3 atau resnet50.")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = torch.hub.load(
+        "PeterL1n/RobustVideoMatting",
+        RVM_MODEL,
+        pretrained=True,
+        trust_repo=True,
+    )
+    model = model.to(device).eval()
+    return model, torch, device
 
 
 def _install_cloudflared() -> str:
@@ -559,7 +643,8 @@ def main() -> None:
     print("Object label model: disabled")
     print(
         "Video: "
-        f"max {MAX_VIDEO_SECONDS}s, {MAX_VIDEO_FPS} fps, {MAX_VIDEO_SIDE}px side"
+        f"RVM {RVM_MODEL}, max {MAX_VIDEO_SECONDS}s, "
+        f"{MAX_VIDEO_FPS} fps, {MAX_VIDEO_SIDE}px side"
     )
     print(f"ONNX Runtime device before warmup: {ort.get_device()}")
     print(f"ONNX Runtime providers: {ort.get_available_providers()}")

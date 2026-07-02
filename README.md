@@ -85,6 +85,10 @@ For this project endpoint:
 - `birefnet-general-lite`: faster/lighter.
 - `u2net`: stable fallback.
 
+Image background removal uses the selected rembg model above. Video background
+removal always uses Robust Video Matting (`RVM_MODEL=mobilenetv3` by default)
+inside the same server.
+
 The server exposes:
 
 - `GET /health`
@@ -102,6 +106,8 @@ Video defaults are intentionally small for Colab demos:
 - `MAX_VIDEO_SECONDS=6`
 - `MAX_VIDEO_FPS=12`
 - `MAX_VIDEO_SIDE=960`
+- `RVM_MODEL=mobilenetv3`
+- `RVM_DOWNSAMPLE_RATIO=auto`
 
 Default video output is transparent WebM:
 
