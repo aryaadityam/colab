@@ -103,6 +103,7 @@ os.environ.setdefault("MAX_VIDEO_FPS", "30")
 os.environ.setdefault("MAX_VIDEO_SIDE", "720")
 os.environ.setdefault("RVM_MODEL", "mobilenetv3")
 os.environ.setdefault("RVM_DOWNSAMPLE_RATIO", "auto")
+os.environ.setdefault("CAPWORDS_MODEL_HOME", "/content/.cache/capwords")
 
 MODEL_NAME = os.getenv("CAPWORDS_SERVER_MODEL", "birefnet-general").strip()
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
@@ -115,6 +116,17 @@ MAX_VIDEO_FPS = int(os.getenv("MAX_VIDEO_FPS", "30"))
 MAX_VIDEO_SIDE = int(os.getenv("MAX_VIDEO_SIDE", "720"))
 RVM_MODEL = os.getenv("RVM_MODEL", "mobilenetv3").strip() or "mobilenetv3"
 RVM_DOWNSAMPLE_RATIO = os.getenv("RVM_DOWNSAMPLE_RATIO", "auto").strip()
+MODEL_HOME = Path(os.getenv("CAPWORDS_MODEL_HOME", "/content/.cache/capwords"))
+RVM_TORCHSCRIPT_URLS = {
+    "mobilenetv3": (
+        "https://github.com/PeterL1n/RobustVideoMatting/releases/download/"
+        "v1.0.0/rvm_mobilenetv3_fp32.torchscript"
+    ),
+    "resnet50": (
+        "https://github.com/PeterL1n/RobustVideoMatting/releases/download/"
+        "v1.0.0/rvm_resnet50_fp32.torchscript"
+    ),
+}
 
 app = FastAPI(title="CapWords Colab GPU Server")
 
@@ -458,16 +470,20 @@ def _rvm_output_to_rgba(foreground: object, alpha: object, torch: object) -> Ima
     return Image.fromarray(rgba, mode="RGBA")
 
 
-def _rvm_downsample_ratio() -> float | None:
+def _rvm_downsample_ratio() -> float:
     value = RVM_DOWNSAMPLE_RATIO.lower()
     if value in {"", "auto", "none", "default"}:
-        return None
+        if MAX_VIDEO_SIDE <= 720:
+            return 0.375
+        if MAX_VIDEO_SIDE <= 1080:
+            return 0.25
+        return 0.2
     try:
         ratio = float(value)
     except ValueError as error:
         raise RuntimeError("RVM_DOWNSAMPLE_RATIO harus auto atau angka float.") from error
     if ratio <= 0:
-        return None
+        return 0.375
     return ratio
 
 
@@ -540,14 +556,27 @@ def _rvm_session() -> tuple[object, object, str]:
         raise RuntimeError("RVM_MODEL harus mobilenetv3 atau resnet50.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = torch.hub.load(
-        "PeterL1n/RobustVideoMatting",
-        RVM_MODEL,
-        pretrained=True,
-        trust_repo=True,
-    )
-    model = model.to(device).eval()
+    model_path = _download_rvm_torchscript(RVM_MODEL)
+    model = torch.jit.load(str(model_path), map_location=device).eval()
+    try:
+        model = torch.jit.freeze(model)
+    except Exception:
+        pass
     return model, torch, device
+
+
+def _download_rvm_torchscript(model_name: str) -> Path:
+    url = RVM_TORCHSCRIPT_URLS[model_name]
+    MODEL_HOME.mkdir(parents=True, exist_ok=True)
+    target = MODEL_HOME / f"rvm_{model_name}_fp32.torchscript"
+    if target.exists() and target.stat().st_size > 0:
+        return target
+
+    temp_target = target.with_suffix(".download")
+    print(f"Downloading RVM TorchScript model: {url}")
+    urllib.request.urlretrieve(url, temp_target)
+    temp_target.replace(target)
+    return target
 
 
 def _install_cloudflared() -> str:

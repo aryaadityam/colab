@@ -103,9 +103,9 @@ side before background removal.
 Video defaults are intentionally small for Colab demos:
 
 - `MAX_VIDEO_UPLOAD_BYTES=83886080`
-- `MAX_VIDEO_SECONDS=6`
-- `MAX_VIDEO_FPS=12`
-- `MAX_VIDEO_SIDE=960`
+- `MAX_VIDEO_SECONDS=25`
+- `MAX_VIDEO_FPS=30`
+- `MAX_VIDEO_SIDE=720`
 - `RVM_MODEL=mobilenetv3`
 - `RVM_DOWNSAMPLE_RATIO=auto`
 
