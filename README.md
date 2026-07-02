@@ -4,7 +4,9 @@ Use this for a temporary GPU-backed CapWords server on Google Colab.
 
 Open directly in Colab:
 
+```text
 https://colab.research.google.com/github/aryaadityam/colab/blob/main/CapWords_Colab_Server.ipynb
+```
 
 Do not open `colab_server.py` as a notebook. It is a Python script, not an
 `.ipynb` JSON notebook.
@@ -88,3 +90,6 @@ The server exposes:
 - `GET /health`
 - `POST /remove-background`
 - `POST /object-label`
+
+Oversized input images are resized to `MAX_PROCESS_SIDE=2048` on the longest
+side before background removal.

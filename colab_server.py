@@ -23,7 +23,7 @@ except Exception:
     _torch = None
 
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageOps
 from rembg import new_session, remove
 from starlette.concurrency import run_in_threadpool
 
@@ -58,6 +58,7 @@ os.environ.setdefault("U2NET_HOME", "/content/.u2net")
 os.environ["CAPWORDS_SERVER_MODEL"] = ARGS.model
 os.environ["CAPWORDS_OBJECT_LABEL_MODEL"] = ARGS.object_label_model
 os.environ.setdefault("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024))
+os.environ.setdefault("MAX_PROCESS_SIDE", "2048")
 
 MODEL_NAME = os.getenv("CAPWORDS_SERVER_MODEL", "birefnet-general").strip()
 OBJECT_LABEL_MODEL = os.getenv(
@@ -65,6 +66,7 @@ OBJECT_LABEL_MODEL = os.getenv(
     "Salesforce/blip-image-captioning-base",
 ).strip()
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
+MAX_PROCESS_SIDE = int(os.getenv("MAX_PROCESS_SIDE", "2048"))
 
 app = FastAPI(title="CapWords Colab GPU Server")
 
@@ -89,6 +91,7 @@ def health() -> dict[str, object]:
         "onnxruntimeDevice": ort.get_device(),
         "onnxruntimeProviders": ort.get_available_providers(),
         "maxUploadBytes": MAX_UPLOAD_BYTES,
+        "maxProcessSide": MAX_PROCESS_SIDE,
     }
 
 
@@ -147,10 +150,30 @@ async def _read_limited_body(request: Request) -> bytes:
 
 
 def _remove_background_sync(image_bytes: bytes) -> bytes:
-    result = remove(image_bytes, session=_model_session())
+    result = remove(_prepare_remove_image(image_bytes), session=_model_session())
     if isinstance(result, bytes):
         return result
     raise RuntimeError("Model tidak mengembalikan PNG bytes.")
+
+
+def _prepare_remove_image(image_bytes: bytes) -> bytes:
+    image = Image.open(io.BytesIO(image_bytes))
+    image = ImageOps.exif_transpose(image)
+    longest_side = max(image.size)
+    if MAX_PROCESS_SIDE > 0 and longest_side > MAX_PROCESS_SIDE:
+        scale = MAX_PROCESS_SIDE / longest_side
+        size = (
+            max(1, round(image.width * scale)),
+            max(1, round(image.height * scale)),
+        )
+        image = image.resize(size, Image.Resampling.LANCZOS)
+
+    output = io.BytesIO()
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        image.convert("RGBA").save(output, format="PNG")
+    else:
+        image.convert("RGB").save(output, format="JPEG", quality=95)
+    return output.getvalue()
 
 
 def _object_label_sync(image_bytes: bytes) -> dict[str, object]:
