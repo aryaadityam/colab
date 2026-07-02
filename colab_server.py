@@ -1,6 +1,4 @@
 import argparse
-import ctypes
-import glob
 import io
 import os
 import shutil
@@ -15,51 +13,6 @@ from tempfile import TemporaryDirectory
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-
-
-def _preload_cuda_libraries() -> None:
-    lib_dirs: list[str] = []
-    if _torch is not None:
-        lib_dirs.append(str(Path(_torch.__file__).resolve().parent / "lib"))
-
-    lib_dirs.extend(
-        glob.glob("/usr/local/lib/python*/site-packages/nvidia/*/lib")
-    )
-    lib_dirs.extend(
-        glob.glob("/usr/local/lib/python*/dist-packages/nvidia/*/lib")
-    )
-
-    existing = [path for path in dict.fromkeys(lib_dirs) if Path(path).is_dir()]
-    if existing:
-        os.environ["LD_LIBRARY_PATH"] = ":".join(
-            existing + [os.environ.get("LD_LIBRARY_PATH", "")]
-        ).rstrip(":")
-
-    for name in (
-        "libcudart.so.12",
-        "libcublas.so.12",
-        "libcublasLt.so.12",
-        "libcudnn.so.9",
-    ):
-        for directory in existing:
-            candidate = Path(directory) / name
-            if not candidate.exists():
-                continue
-            try:
-                ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
-                break
-            except OSError:
-                continue
-
-
-# Import torch first so its CUDA/cuDNN libraries are visible before ONNX Runtime
-# initializes the CUDA execution provider on Colab.
-try:
-    import torch as _torch  # noqa: F401
-except Exception:
-    _torch = None
-
-_preload_cuda_libraries()
 
 import onnxruntime as ort
 from PIL import Image, ImageColor, ImageOps
@@ -104,6 +57,7 @@ os.environ.setdefault("MAX_VIDEO_SIDE", "720")
 os.environ.setdefault("RVM_MODEL", "mobilenetv3")
 os.environ.setdefault("RVM_DOWNSAMPLE_RATIO", "auto")
 os.environ.setdefault("CAPWORDS_MODEL_HOME", "/content/.cache/capwords")
+os.environ.setdefault("PRELOAD_VIDEO_MODEL", "1")
 
 MODEL_NAME = os.getenv("CAPWORDS_SERVER_MODEL", "birefnet-general").strip()
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
@@ -117,6 +71,12 @@ MAX_VIDEO_SIDE = int(os.getenv("MAX_VIDEO_SIDE", "720"))
 RVM_MODEL = os.getenv("RVM_MODEL", "mobilenetv3").strip() or "mobilenetv3"
 RVM_DOWNSAMPLE_RATIO = os.getenv("RVM_DOWNSAMPLE_RATIO", "auto").strip()
 MODEL_HOME = Path(os.getenv("CAPWORDS_MODEL_HOME", "/content/.cache/capwords"))
+PRELOAD_VIDEO_MODEL = os.getenv("PRELOAD_VIDEO_MODEL", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 RVM_TORCHSCRIPT_URLS = {
     "mobilenetv3": (
         "https://github.com/PeterL1n/RobustVideoMatting/releases/download/"
@@ -133,7 +93,12 @@ app = FastAPI(title="CapWords Colab GPU Server")
 
 @app.on_event("startup")
 async def warm_up_model() -> None:
+    print(f"Preloading image model: {MODEL_NAME}")
     await run_in_threadpool(_model_session)
+    if PRELOAD_VIDEO_MODEL:
+        print(f"Preloading video model: RVM {RVM_MODEL}")
+        await run_in_threadpool(_rvm_session)
+    print("Model preload complete.")
 
 
 @app.get("/")
@@ -141,8 +106,31 @@ def root() -> dict[str, object]:
     return health()
 
 
+@lru_cache(maxsize=1)
+def _torch_cuda_status() -> dict[str, object]:
+    try:
+        import torch
+
+        cuda_available = bool(torch.cuda.is_available())
+        return {
+            "torchCudaAvailable": cuda_available,
+            "torchCudaVersion": getattr(torch.version, "cuda", None),
+            "torchDevice": torch.cuda.get_device_name(0)
+            if cuda_available
+            else None,
+        }
+    except Exception as error:
+        return {
+            "torchCudaAvailable": False,
+            "torchCudaVersion": None,
+            "torchDevice": None,
+            "torchImportError": str(error),
+        }
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
+    torch_status = _torch_cuda_status()
     return {
         "ok": True,
         "provider": "capwords-colab",
@@ -158,6 +146,8 @@ def health() -> dict[str, object]:
         "maxVideoSide": MAX_VIDEO_SIDE,
         "videoModel": f"rvm-{RVM_MODEL}",
         "videoDownsampleRatio": RVM_DOWNSAMPLE_RATIO,
+        "preloadVideoModel": PRELOAD_VIDEO_MODEL,
+        **torch_status,
     }
 
 

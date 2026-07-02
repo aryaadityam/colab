@@ -18,6 +18,7 @@ Do not open `colab_server.py` as a notebook. It is a Python script, not an
 3. Run:
 
 ```bash
+!pip uninstall -y -q onnxruntime onnxruntime-gpu rembg nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cudnn-cu12
 !pip install -q -r requirements-colab.txt
 ```
 
@@ -88,6 +89,10 @@ For this project endpoint:
 Image background removal uses the selected rembg model above. Video background
 removal always uses Robust Video Matting (`RVM_MODEL=mobilenetv3` by default)
 inside the same server.
+
+Startup preloads both models by default. `/health` should show
+`CUDAExecutionProvider` for image GPU and `torchCudaAvailable: true` for video
+GPU on a T4 runtime.
 
 The server exposes:
 
