@@ -98,9 +98,9 @@ os.environ["CAPWORDS_SERVER_MODEL"] = ARGS.model
 os.environ.setdefault("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024))
 os.environ.setdefault("MAX_PROCESS_SIDE", "2048")
 os.environ.setdefault("MAX_VIDEO_UPLOAD_BYTES", str(80 * 1024 * 1024))
-os.environ.setdefault("MAX_VIDEO_SECONDS", "6")
-os.environ.setdefault("MAX_VIDEO_FPS", "12")
-os.environ.setdefault("MAX_VIDEO_SIDE", "960")
+os.environ.setdefault("MAX_VIDEO_SECONDS", "25")
+os.environ.setdefault("MAX_VIDEO_FPS", "30")
+os.environ.setdefault("MAX_VIDEO_SIDE", "720")
 os.environ.setdefault("RVM_MODEL", "mobilenetv3")
 os.environ.setdefault("RVM_DOWNSAMPLE_RATIO", "auto")
 
@@ -110,9 +110,9 @@ MAX_PROCESS_SIDE = int(os.getenv("MAX_PROCESS_SIDE", "2048"))
 MAX_VIDEO_UPLOAD_BYTES = int(
     os.getenv("MAX_VIDEO_UPLOAD_BYTES", str(80 * 1024 * 1024))
 )
-MAX_VIDEO_SECONDS = float(os.getenv("MAX_VIDEO_SECONDS", "6"))
-MAX_VIDEO_FPS = int(os.getenv("MAX_VIDEO_FPS", "12"))
-MAX_VIDEO_SIDE = int(os.getenv("MAX_VIDEO_SIDE", "960"))
+MAX_VIDEO_SECONDS = float(os.getenv("MAX_VIDEO_SECONDS", "25"))
+MAX_VIDEO_FPS = int(os.getenv("MAX_VIDEO_FPS", "30"))
+MAX_VIDEO_SIDE = int(os.getenv("MAX_VIDEO_SIDE", "720"))
 RVM_MODEL = os.getenv("RVM_MODEL", "mobilenetv3").strip() or "mobilenetv3"
 RVM_DOWNSAMPLE_RATIO = os.getenv("RVM_DOWNSAMPLE_RATIO", "auto").strip()
 
