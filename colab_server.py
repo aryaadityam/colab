@@ -1,4 +1,6 @@
 import argparse
+import ctypes
+import glob
 import io
 import os
 import re
@@ -15,12 +17,50 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+
+def _preload_cuda_libraries() -> None:
+    lib_dirs: list[str] = []
+    if _torch is not None:
+        lib_dirs.append(str(Path(_torch.__file__).resolve().parent / "lib"))
+
+    lib_dirs.extend(
+        glob.glob("/usr/local/lib/python*/site-packages/nvidia/*/lib")
+    )
+    lib_dirs.extend(
+        glob.glob("/usr/local/lib/python*/dist-packages/nvidia/*/lib")
+    )
+
+    existing = [path for path in dict.fromkeys(lib_dirs) if Path(path).is_dir()]
+    if existing:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(
+            existing + [os.environ.get("LD_LIBRARY_PATH", "")]
+        ).rstrip(":")
+
+    for name in (
+        "libcudart.so.12",
+        "libcublas.so.12",
+        "libcublasLt.so.12",
+        "libcudnn.so.9",
+    ):
+        for directory in existing:
+            candidate = Path(directory) / name
+            if not candidate.exists():
+                continue
+            try:
+                ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+                break
+            except OSError:
+                continue
+
+
 # Import torch first so its CUDA/cuDNN libraries are visible before ONNX Runtime
 # initializes the CUDA execution provider on Colab.
 try:
     import torch as _torch  # noqa: F401
 except Exception:
     _torch = None
+
+_preload_cuda_libraries()
 
 import onnxruntime as ort
 from PIL import Image, ImageOps
@@ -261,9 +301,28 @@ def _caption_to_label(caption: str) -> str | None:
         "metal",
     }:
         words.pop(0)
+    words = [
+        word
+        for word in words
+        if word
+        not in {
+            "object",
+            "item",
+            "thing",
+            "stuff",
+            "piece",
+            "photo",
+            "image",
+            "picture",
+            "person",
+            "someone",
+            "hand",
+            "hands",
+        }
+    ]
     if not words:
         return None
-    return " ".join(words[:4])
+    return words[0]
 
 
 def _object_label_enabled() -> bool:
