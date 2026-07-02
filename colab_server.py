@@ -157,13 +157,23 @@ def _object_label_sync(image_bytes: bytes) -> dict[str, object]:
     if not _object_label_enabled():
         return {"label": None, "caption": None, "model": None}
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = _open_label_image(image_bytes)
     caption = _caption_image(image)
     return {
         "label": _caption_to_label(caption),
         "caption": caption,
         "model": OBJECT_LABEL_MODEL,
     }
+
+
+def _open_label_image(image_bytes: bytes) -> Image.Image:
+    image = Image.open(io.BytesIO(image_bytes))
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        background.alpha_composite(rgba)
+        return background.convert("RGB")
+    return image.convert("RGB")
 
 
 def _caption_image(image: Image.Image) -> str:
