@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+rembg[gpu]>=2.0.76
+torch>=2.2
+transformers>=4.44
+pyngrok>=7.2
