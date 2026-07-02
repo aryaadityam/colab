@@ -14,6 +14,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+
+# Import torch first so its CUDA/cuDNN libraries are visible before ONNX Runtime
+# initializes the CUDA execution provider on Colab.
+try:
+    import torch as _torch  # noqa: F401
+except Exception:
+    _torch = None
+
 import onnxruntime as ort
 from PIL import Image
 from rembg import new_session, remove
