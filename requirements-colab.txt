@@ -1,4 +1,6 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
+onnxruntime==1.20.1
+rembg==2.0.67
 imageio-ffmpeg>=0.5
 pyngrok>=7.2
