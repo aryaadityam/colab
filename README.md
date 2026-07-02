@@ -2,6 +2,13 @@
 
 Use this for a temporary GPU-backed CapWords server on Google Colab.
 
+Open directly in Colab:
+
+https://colab.research.google.com/github/aryaadityam/colab/blob/main/CapWords_Colab_Server.ipynb
+
+Do not open `colab_server.py` as a notebook. It is a Python script, not an
+`.ipynb` JSON notebook.
+
 ## Colab Setup
 
 1. Open a Colab notebook and set runtime to GPU.
